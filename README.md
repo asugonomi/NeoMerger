@@ -1,3 +1,5 @@
+> **asugonomi modification fork:** [日本語の変更点・導入・検証範囲](README_MODIFICATIONS.md) / [Reversible installer](https://github.com/asugonomi/ForgeNeoModification). Based on `fc116dc4f348`.
+
 # NeoMerger
 
 [![ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/akinak4)

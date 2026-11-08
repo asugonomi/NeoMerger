@@ -67,29 +67,106 @@ def get_lora_dir() -> str:
             return opts.lora_dir
     return os.path.join(models_path, "Lora")
 
+# Load by filename: extension script directories are not consistently on sys.path.
+import importlib.util as _import_util
+import sys as _sys
+_catalog_spec = _import_util.spec_from_file_location(
+    "neomerger_catalog", os.path.join(os.path.dirname(__file__), "neomerger_catalog.py"))
+_catalog_module = _import_util.module_from_spec(_catalog_spec)
+_catalog_spec.loader.exec_module(_catalog_module)
+
+
+def _search_roots(kind):
+    opts = getattr(shared, "cmd_opts", None)
+    names = ("ckpt_dirs", "ckpt_dir") if kind == "checkpoint" else ("lora_dirs", "lora_dir")
+    roots = []
+    for name in names:
+        value = getattr(opts, name, None)
+        roots.extend([value] if isinstance(value, str) else (value or []))
+    roots.append(getattr(sd_models, "model_path", None) or os.path.join(models_path, "Stable-diffusion")
+                 if kind == "checkpoint" else os.path.join(models_path, "Lora"))
+    return list(dict.fromkeys(roots))
+
+
+def _registered_loras():
+    module = _sys.modules.get("networks")
+    return getattr(module, "available_networks", {}).values()
+
+
+_model_catalog = _catalog_module.Catalog(
+    lambda: _search_roots("checkpoint"),
+    lambda: getattr(sd_models, "checkpoints_list", {}).values(),
+    {".safetensors", ".ckpt"}, "checkpoint")
+_lora_catalog = _catalog_module.Catalog(
+    lambda: _search_roots("lora"), _registered_loras,
+    {".safetensors", ".ckpt", ".pt"}, "lora")
+
+
 def get_model_list():
-    d = get_ckpt_dir()
-    out = []
-    for ext in ["*.safetensors", "*.ckpt"]:
-        out += [os.path.basename(str(p)) for p in Path(d).rglob(ext)]
-    return sorted(out)
+    return _model_catalog.choices()
+
 
 def get_lora_list():
-    d = get_lora_dir()
-    out = []
-    for ext in ["*.safetensors", "*.pt", "*.ckpt"]:
-        out += [os.path.basename(str(p)) for p in Path(d).rglob(ext)]
-    return sorted(out)
+    return _lora_catalog.choices()
+
 
 def find_in_dir(name: str, directory: str) -> str:
-    for root, _, files in os.walk(directory):
-        for f in files:
-            if f == name:
-                return os.path.join(root, f)
-    return name
+    catalog = _catalog_module.Catalog(lambda: [directory], lambda: [],
+                                      {".safetensors", ".ckpt", ".pt"}, "file")
+    return catalog.resolve(name)
 
-def find_model(name): return find_in_dir(name, get_ckpt_dir())
-def find_lora(name):  return find_in_dir(name, get_lora_dir())
+
+def _resolve_catalog(catalog, name):
+    try:
+        return catalog.resolve(name)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def find_model(name):
+    return _resolve_catalog(_model_catalog, name)
+
+
+def find_lora(name):
+    return _resolve_catalog(_lora_catalog, name)
+
+
+def _assert_distinct_output(output_path, inputs):
+    for source in inputs:
+        if source and _catalog_module.same_file(output_path, source):
+            raise ValueError(f"Output is an input model: {output_path}")
+    if os.path.lexists(output_path) and (
+            os.path.islink(output_path) or
+            _catalog_module.canonical(output_path) != os.path.normcase(os.path.abspath(output_path))):
+        raise ValueError(f"Refusing to overwrite an existing file through a link: {output_path}")
+
+
+def _refresh_selections(kinds, values):
+    # Keep identities as well as labels: a retargeted link must not silently select a new file.
+    previous = []
+    for kind, value in zip(kinds, values):
+        cat = _lora_catalog if kind == "lora" or (kind == "mixed" and str(value).startswith("[LoRA] ")) else _model_catalog
+        clean = value[7:] if kind == "mixed" and str(value).startswith("[LoRA] ") else value
+        try:
+            token = cat.select(clean)
+            previous.append((cat, token, cat.entries[token][1:]))
+        except ValueError:
+            previous.append((cat, None, None))
+    _model_catalog.refresh()
+    _lora_catalog.refresh()
+    updates = []
+    for kind, value, (cat, token, old_identity) in zip(kinds, values, previous):
+        choices = (get_model_list() + ["[LoRA] " + x for x in get_lora_list()] if kind == "mixed"
+                   else get_lora_list() if kind == "lora" else get_model_list())
+        if kind == "optional":
+            choices = [""] + choices
+        selected = None
+        if token in cat.entries and cat.entries[token][1:] == old_identity:
+            selected = ("[LoRA] " if kind == "mixed" and cat is _lora_catalog else "") + token
+        elif value:
+            gr.Warning(f"Model removed or link changed: {value}. Select it again.")
+        updates.append(gr.update(choices=choices, value=selected))
+    return updates
 
 
 # ── Output file names ────────────────────────────────────────────────────────
@@ -180,13 +257,15 @@ def resolve_output_path(directory: str, typed_name: str, auto_name: str,
     overwrite = _opt(OPT_OVERWRITE, OVERWRITE_KEEP) == OVERWRITE_YES
 
     def _norm(pth):
-        return os.path.normcase(os.path.abspath(pth))
+        return _catalog_module.canonical(pth)
     protected = {_norm(pth) for pth in (inputs or ()) if pth}
 
     def _taken(pth):
         if not os.path.exists(pth):
             return False
-        return (not overwrite) or (_norm(pth) in protected)
+        return (not overwrite) or os.path.islink(pth) or (
+            _norm(pth) != os.path.normcase(os.path.abspath(pth))) or (_norm(pth) in protected) or any(
+            _catalog_module.same_file(pth, source) for source in (inputs or ()) if source)
 
     path = os.path.join(directory, name + ".safetensors")
     if _taken(path):
@@ -2628,6 +2707,7 @@ def merge_models_method(path_a, path_b, path_c, block_weights_b, global_alpha,
       donor_weights     multiplier per donor, aligned with path_b (index 0 = 1.0)
       legacy_taskvec    task-vector methods use global_alpha for every block
     """
+    _assert_distinct_output(output_path, [path_a, *(path_b if isinstance(path_b, (list, tuple)) else [path_b]), path_c, vae_path])
     import time
     _STOP_MERGE[0] = False
     _QUANTILE_TIME[0] = 0.0
@@ -3430,6 +3510,7 @@ def bake_lora_into_checkpoint(ckpt_path, lora_path, block_weights, output_path,
     shape checks, logs the match report and returns without writing anything.
     The report is also stored in _LAST_BAKE_REPORT[0].
     """
+    _assert_distinct_output(output_path, [ckpt_path, lora_path, vae_path, find_model(lora_ref_model) if lora_ref_model else None])
     import time
     _STOP_MERGE[0] = False
     t_start = time.time()
@@ -3478,7 +3559,7 @@ def bake_lora_into_checkpoint(ckpt_path, lora_path, block_weights, output_path,
         _ckpt_depth = _anima_depth_from_keys(list(sd.keys()))
         _ref_path = None
         if lora_ref_model:
-            _ref_path = find_model(lora_ref_model) or lora_ref_model
+            _ref_path = find_model(lora_ref_model)
         if _ref_path and os.path.isfile(_ref_path):
             # The reference is the LoRA's base model, so its depth is the LoRA's depth.
             _lora_depth = anima_block_count(_ref_path)
@@ -4091,6 +4172,7 @@ def merge_loras(path_a, path_b, weight_a, output_path,
     weight_a: how much of LoRA A to keep (0.0 = only B, 1.0 = only A).
     Handles rank differences by zero-padding the smaller LoRA.
     """
+    _assert_distinct_output(output_path, [path_a, path_b])
     import time
     t_start = time.time()
     _log(f"LoRA Merge: {os.path.basename(path_a)} + {os.path.basename(path_b)}")
@@ -4275,6 +4357,7 @@ def extract_lora_from_models(path_ft, path_base, output_path, rank=32,
       clamp_q   outlier clamp quantile applied to the SVD factors
       min_diff  keys whose |delta| never exceeds this are skipped as identical
     """
+    _assert_distinct_output(output_path, [path_ft, path_base])
     import time
     _STOP_MERGE[0] = False
     t_start = time.time()
@@ -4889,12 +4972,7 @@ def on_ui_tabs():
                                             label="weight", scale=1))
 
                             bm_refresh = gr.Button("↻  Refresh", size="sm", variant="secondary")
-                            bm_refresh.click(
-                                fn=lambda: [gr.update(choices=get_model_list())]
-                                           * (3 + EXTRA_DONOR_SLOTS),
-                                outputs=[bm_model_a, bm_model_b, bm_model_c]
-                                        + bm_extra_models
-                            )
+                            # Refresh is bound to all model selectors below.
 
                         gr.Markdown("")
 
@@ -6402,12 +6480,7 @@ def on_ui_tabs():
                                              "upscale). Pick the model the LoRA was trained on."
                                     )
                                     bi_refresh = gr.Button("↻  Refresh", size="sm", variant="secondary")
-                                    bi_refresh.click(
-                                        fn=lambda: [gr.update(choices=get_model_list()),
-                                                    gr.update(choices=get_lora_list()),
-                                                    gr.update(choices=[""] + get_model_list())],
-                                        outputs=[bi_ckpt, bi_lora, bi_ref]
-                                    )
+                                    # Refresh is bound to all model selectors below.
 
                                 gr.Markdown("")
 
@@ -6671,10 +6744,7 @@ def on_ui_tabs():
                                     lm_lora_a  = gr.Dropdown(ll2, label="LoRA A")
                                     lm_lora_b  = gr.Dropdown(ll2, label="LoRA B")
                                     lm_refresh = gr.Button("↻  Refresh", size="sm", variant="secondary")
-                                    lm_refresh.click(
-                                        fn=lambda: [gr.update(choices=get_lora_list())] * 2,
-                                        outputs=[lm_lora_a, lm_lora_b]
-                                    )
+                                    # Refresh is bound to all model selectors below.
 
                                 gr.Markdown("")
 
@@ -6774,10 +6844,7 @@ def on_ui_tabs():
                                     ex_model_ft   = gr.Dropdown(ml3, label="Finetuned / merged model  (A)")
                                     ex_model_base = gr.Dropdown(ml3, label="Base model  (B)")
                                     ex_refresh = gr.Button("↻  Refresh", size="sm", variant="secondary")
-                                    ex_refresh.click(
-                                        fn=lambda: [gr.update(choices=get_model_list())] * 2,
-                                        outputs=[ex_model_ft, ex_model_base]
-                                    )
+                                    # Refresh is bound to all model selectors below.
 
                                 gr.Markdown("")
 
@@ -6911,12 +6978,7 @@ def on_ui_tabs():
                             all_models = get_model_list() + [f"[LoRA] {l}" for l in get_lora_list()]
                             ins_file    = gr.Dropdown(all_models, label="Select model or LoRA")
                             ins_refresh = gr.Button("↻  Refresh", size="sm", variant="secondary")
-                            ins_refresh.click(
-                                fn=lambda: gr.update(
-                                    choices=get_model_list() + [f"[LoRA] {l}" for l in get_lora_list()]
-                                ),
-                                outputs=[ins_file]
-                            )
+                            # Refresh is bound to all model selectors below.
                             ins_btn = gr.Button("🔍  Inspect", variant="primary")
 
                         gr.Markdown("")
@@ -7269,17 +7331,22 @@ def on_ui_tabs():
                             label="Select file to clear", scale=4
                         )
                         ins_clear_ref = gr.Button("↻", size="sm", scale=1)
-                        ins_clear_ref.click(
-                            fn=lambda: gr.update(
-                                choices=get_model_list() + [f"[LoRA] {l}" for l in get_lora_list()]
-                            ),
-                            outputs=[ins_clear_file]
-                        )
+                        # Refresh is bound to all model selectors below.
+                    ins_clear_preview = gr.Button("Preview actual file path")
+                    ins_clear_path = gr.Textbox(label="Confirmed actual file to overwrite", interactive=False)
+                    ins_clear_confirmed = gr.State(None)
                     ins_clear_btn    = gr.Button("🗑️  Clear metadata", variant="stop")
                     ins_clear_status = gr.Markdown("")
                     ins_clear_progress = gr.Slider(0.0, 1.0, value=0.0, label="Progress", interactive=False)
 
-                def do_clear_metadata(name):
+                def _clear_preview(name):
+                    if not name:
+                        return "", None
+                    path = find_lora(name[7:]) if name.startswith("[LoRA] ") else find_model(name)
+                    stamp = os.stat(path)
+                    return path, (name, path, stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns)
+
+                def do_clear_metadata(name, confirmed_path, confirmed):
                     if not name:
                         return "❌  Select a file.", 0.0
 
@@ -7293,7 +7360,13 @@ def on_ui_tabs():
                     if not path.endswith(".safetensors"):
                         return "❌  Only .safetensors files are supported.", 0.0
 
-                    tmp_path = path + ".tmp_clear"
+                    stamp = os.stat(path)
+                    current = (name, path, stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns)
+                    if not confirmed or tuple(confirmed) != current or confirmed_path != path:
+                        return "❌ Preview the actual file path again before clearing metadata.", 0.0
+                    import tempfile
+                    fd, tmp_path = tempfile.mkstemp(prefix=".neomerger-clear-", suffix=".tmp", dir=os.path.dirname(path))
+                    os.close(fd)
 
                     try:
                         from safetensors import safe_open
@@ -7308,6 +7381,9 @@ def on_ui_tabs():
                         del tensors
                         torch.cuda.empty_cache()
 
+                        stamp = os.stat(path)
+                        if (name, path, stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns) != current:
+                            raise ValueError("File changed after confirmation; cancelled")
                         os.replace(tmp_path, path)
 
                         size = os.path.getsize(path) / 1e9
@@ -7319,9 +7395,11 @@ def on_ui_tabs():
                             except Exception: pass
                         return f"❌  Error: {e} — original file is unchanged.", 0.0
 
+                ins_clear_preview.click(_clear_preview, inputs=[ins_clear_file],
+                                        outputs=[ins_clear_path, ins_clear_confirmed])
                 ins_clear_btn.click(
                     fn=do_clear_metadata,
-                    inputs=[ins_clear_file],
+                    inputs=[ins_clear_file, ins_clear_path, ins_clear_confirmed],
                     outputs=[ins_clear_status, ins_clear_progress]
                 )
 
@@ -7440,8 +7518,7 @@ def on_ui_tabs():
                 pr_model_b.change(_pr_model_change, inputs=[pr_model_b],
                                   outputs=[pr_arch, pr_blocks])
 
-                pr_refresh.click(lambda: gr.update(choices=get_model_list()),
-                                 outputs=[pr_model_b])
+                # Refresh is bound to all model selectors below.
 
                 pr_run.click(
                     fn=run_block_probe,
@@ -7451,6 +7528,23 @@ def on_ui_tabs():
                     outputs=[pr_status, pr_gallery],
                 )
 
+
+    with ui:
+        with gr.Accordion("Resolved model paths (read-only)", open=False):
+            _path_a = gr.Textbox(label="Model A actual file", interactive=False)
+            _path_b = gr.Textbox(label="Model B actual file", interactive=False)
+        bm_model_a.change(lambda value: find_model(value) if value else "", inputs=[bm_model_a], outputs=[_path_a])
+        bm_model_b.change(lambda value: find_model(value) if value else "", inputs=[bm_model_b], outputs=[_path_b])
+        _selectors = ([bm_model_a, bm_model_b, bm_model_c] + bm_extra_models
+                      + [bi_ckpt, bi_lora, bi_ref, lm_lora_a, lm_lora_b,
+                         ex_model_ft, ex_model_base, ins_file, ins_clear_file, pr_model_b])
+        _kinds = (["checkpoint"] * (3 + EXTRA_DONOR_SLOTS)
+                  + ["checkpoint", "lora", "optional", "lora", "lora",
+                     "checkpoint", "checkpoint", "mixed", "mixed", "checkpoint"])
+        for button in (bm_refresh, bi_refresh, lm_refresh, ex_refresh,
+                       ins_refresh, ins_clear_ref, pr_refresh):
+            button.click(lambda *values: _refresh_selections(_kinds, values),
+                         inputs=_selectors, outputs=_selectors)
 
     return [(ui, "NeoMerger", "neo_merger")]
 
